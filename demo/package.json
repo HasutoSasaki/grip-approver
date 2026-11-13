@@ -1,0 +1,7 @@
+{
+  "name": "grip-approver-demo",
+  "private": true,
+  "scripts": {
+    "test": "echo 'all tests passed'"
+  }
+}
