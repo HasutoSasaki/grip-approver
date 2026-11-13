@@ -34,7 +34,7 @@ Claude Code ──PreToolUse hook──▶ grip_gate.py ──HTTP──▶ grip
 |---|---|
 | GPIO4 | グリップ片側のアルミテープ |
 | GND | グリップ反対側のアルミテープ |
-| GPIO25 | アクティブブザー（+） |
+| GPIO33 | アクティブブザー（+） |
 | GND | アクティブブザー（−） |
 | GPIO2 | 基板上の LED（配線不要） |
 

@@ -11,7 +11,7 @@
 #define CMD_UUID     "8f1e0003-4b1a-4c3e-9d2a-6a7b6e0c1a01"
 
 const int GRIP_PIN = 4;     // アルミテープ接点。握り切ると GND と導通して LOW
-const int BUZZER_PIN = 25;  // アクティブブザー
+const int BUZZER_PIN = 33;  // アクティブブザー（GPIO25 は会議ランプの赤 LED が使う）
 const int LED_PIN = 2;      // 基板上 LED
 
 const unsigned long DEBOUNCE_MS = 30;
