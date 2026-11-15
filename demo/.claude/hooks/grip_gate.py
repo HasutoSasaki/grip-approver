@@ -74,12 +74,13 @@ def main():
         })
         with urllib.request.urlopen(f"{DAEMON_URL}?{query}", timeout=timeout + 5) as res:
             data = json.load(res)
-    except Exception as e:  # noqa: BLE001
-        decide("ask", f"GripApprover に接続できないため、通常の確認に切り替えます（{e.__class__.__name__}）")
-        return
+    except Exception:  # noqa: BLE001
+        return  # アプリが起動していないときは何もせず、通常の権限フローに任せる
 
     result = data.get("result")
     done = data.get("done", 0)
+    if result == "off":
+        return  # メニューバーでオフにしているときも同じ
     if result == "approved":
         decide("allow", f"{reps}回の握力で承認されました")
     elif result == "timeout":
