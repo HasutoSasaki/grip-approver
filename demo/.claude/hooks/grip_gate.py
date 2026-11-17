@@ -12,8 +12,10 @@ import urllib.request
 
 DAEMON_URL = "http://127.0.0.1:8766/wait"
 
+# rm の危ないパターン。settings.json では rm だけ別の hook にして「50回」と表示している
+RM_PATTERN = r"\brm\b[^|;&]*\s(-[a-z]*[rf][a-z]*|--recursive|--force)\b"
 DANGEROUS_PATTERNS = [
-    r"\brm\b[^|;&]*\s(-[a-z]*[rf][a-z]*|--recursive|--force)\b",
+    RM_PATTERN,
     r"\bgit\s+push\b[^|;&]*\s(--force(-with-lease)?|-f)\b",
     r"\bgit\s+reset\b[^|;&]*\s--hard\b",
     r"\bgit\s+clean\b[^|;&]*\s-[a-z]*f",
@@ -57,13 +59,23 @@ def decide(decision, reason):
     }, ensure_ascii=False))
 
 
+def handled_elsewhere(tool_name, tool_input, mode):
+    """Bash は「rm の危ないコマンド用」と「それ以外用」の2つの hook から呼ばれる。
+    同じコマンドで二重に待たないよう、自分の担当でなければ何もしない"""
+    if tool_name != "Bash":
+        return False
+    is_rm = re.search(RM_PATTERN, tool_input.get("command", ""), re.IGNORECASE) is not None
+    return (mode == "--rm-only" and not is_rm) or (mode == "--skip-rm" and is_rm)
+
+
 def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
     try:
         event = json.load(sys.stdin)
         tool_name = event.get("tool_name", "")
         tool_input = event.get("tool_input") or {}
         reps = required_reps(tool_name, tool_input)
-        if reps == 0:
+        if reps == 0 or handled_elsewhere(tool_name, tool_input, mode):
             return  # 通常の権限フローに任せる
 
         timeout = min(15 + reps * 3, 110)

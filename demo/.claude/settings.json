@@ -9,15 +9,50 @@
       "Bash(git push -f origin main)"
     ]
   },
+  "spinnerTipsEnabled": false,
+  "spinnerVerbs": {
+    "mode": "replace",
+    "verbs": ["握力を測定中", "前腕を追い込み中", "グリップを強化中", "握り込み中"]
+  },
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit|WebFetch|mcp__.*",
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(rm *)",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/grip_gate.py --rm-only",
+            "timeout": 120,
+            "statusMessage": "💪 ハンドグリップを50回握ってください"
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/grip_gate.py --skip-rm",
+            "timeout": 120,
+            "statusMessage": "💪 ハンドグリップを10回握ってください（sudo などは50回）"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|mcp__.*",
         "hooks": [
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/grip_gate.py",
-            "timeout": 120
+            "timeout": 120,
+            "statusMessage": "💪 ハンドグリップを5回握ってください"
+          }
+        ]
+      },
+      {
+        "matcher": "WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/grip_gate.py",
+            "timeout": 120,
+            "statusMessage": "💪 ハンドグリップを3回握ってください"
           }
         ]
       }
