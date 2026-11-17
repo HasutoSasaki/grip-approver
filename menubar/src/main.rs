@@ -1,14 +1,19 @@
 // GripApprover メニューバーアプリ
 //
-// ESP32 と USB シリアルでつなぎ、hook からの HTTP リクエストを握った回数で待たせる。
+// ESP32 と BLE か USB シリアルでつなぎ、hook からの HTTP リクエストを握った回数で待たせる。
+// USB のポートがあればシリアルを使い、なければ BLE で探す（同時には使わない）。
 // メニューバーの「オン」を外している間は、hook に off を返して何もさせない。
 // オフにしてもシリアルのポートは閉じない（macOS の CP2102 ドライバが、閉じている間に
 // 届いたデータを開き直したときに繰り返し渡すことがあるため）。
+use std::error::Error;
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, WriteType};
+use btleplug::platform::{Adapter, Manager, Peripheral};
+use futures::StreamExt;
 use serde_json::json;
 use serialport::SerialPort;
 use tao::event::{Event, StartCause};
@@ -16,11 +21,15 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
+use uuid::Uuid;
 
 const BAUD: u32 = 115_200;
 const PORT_PREFIXES: [&str; 3] = ["cu.usbserial-", "cu.SLAB_USBtoUART", "cu.wchusbserial"];
 const HTTP_ADDR: &str = "127.0.0.1:8766";
 const BAR_WIDTH: u32 = 30;
+const BLE_SERVICE: Uuid = Uuid::from_u128(0x8f1e0001_4b1a_4c3e_9d2a_6a7b6e0c1a01);
+const BLE_COUNT: Uuid = Uuid::from_u128(0x8f1e0002_4b1a_4c3e_9d2a_6a7b6e0c1a01);
+const BLE_CMD: Uuid = Uuid::from_u128(0x8f1e0003_4b1a_4c3e_9d2a_6a7b6e0c1a01);
 
 enum UserEvent {
     Menu(MenuEvent),
@@ -43,10 +52,16 @@ struct State {
     waiting: Option<Waiting>,
 }
 
+/// ESP32 へコマンドを送る先。つながっている方だけを持つ
+enum Link {
+    Serial(Box<dyn SerialPort>),
+    Ble(tokio::sync::mpsc::UnboundedSender<u8>),
+}
+
 struct App {
     state: Mutex<State>,
     cond: Condvar,
-    writer: Mutex<Option<Box<dyn SerialPort>>>,
+    writer: Mutex<Option<Link>>,
     proxy: Mutex<EventLoopProxy<UserEvent>>,
 }
 
@@ -56,10 +71,28 @@ impl App {
     }
 
     fn send_command(&self, cmd: &[u8]) {
-        if let Some(port) = self.writer.lock().unwrap().as_mut() {
-            if let Err(e) = port.write_all(cmd) {
-                log(&format!("ESP32 へのコマンド送信に失敗しました: {e}"));
+        match self.writer.lock().unwrap().as_mut() {
+            Some(Link::Serial(port)) => {
+                if let Err(e) = port.write_all(cmd) {
+                    log(&format!("ESP32 へのコマンド送信に失敗しました: {e}"));
+                }
             }
+            // BLE の書き込みは非同期なので、BLE の処理側に渡して書いてもらう
+            Some(Link::Ble(tx)) => cmd.iter().for_each(|&c| {
+                let _ = tx.send(c);
+            }),
+            None => {}
+        }
+    }
+
+    /// ESP32 から届いた累計回数を、前回との差分にして総握り回数に足す
+    fn add_count(&self, last: &mut u64, value: u64) {
+        // 値が減ったら ESP32 が再起動したとみなし、新しい値をそのまま加算する
+        let delta = if value >= *last { value - *last } else { value };
+        *last = value;
+        if delta > 0 {
+            self.state.lock().unwrap().total += delta;
+            self.cond.notify_all();
         }
     }
 }
@@ -276,9 +309,9 @@ fn set_connected(app: &App, connected: bool, port: &str) {
     app.refresh();
 }
 
-fn run_connection(app: &App, port_name: &str) -> io::Result<()> {
+fn run_serial(app: &App, port_name: &str) -> io::Result<()> {
     let port = serialport::new(port_name, BAUD).timeout(Duration::from_millis(500)).open()?;
-    *app.writer.lock().unwrap() = Some(port.try_clone()?);
+    *app.writer.lock().unwrap() = Some(Link::Serial(port.try_clone()?));
     let mut reader = BufReader::new(port);
 
     let Some(mut last) = read_baseline(app, &mut reader)? else {
@@ -291,34 +324,127 @@ fn run_connection(app: &App, port_name: &str) -> io::Result<()> {
     loop {
         let Some(line) = read_line(&mut reader, &mut buf)? else { continue };
         let Some((_, value)) = parse_line(&line) else { continue };
-        // 値が減ったら ESP32 が再起動したとみなし、新しい値をそのまま加算する
-        let delta = if value >= last { value - last } else { value };
-        last = value;
-        if delta > 0 {
-            app.state.lock().unwrap().total += delta;
-            app.cond.notify_all();
+        app.add_count(&mut last, value);
+    }
+}
+
+// ---- BLE ----
+
+fn le_u32(bytes: &[u8]) -> Option<u64> {
+    Some(u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as u64)
+}
+
+/// GripApprover のサービス UUID で探す。見つからなければ None
+async fn find_ble(adapter: &Adapter, wait: Duration) -> btleplug::Result<Option<Peripheral>> {
+    adapter.start_scan(ScanFilter { services: vec![BLE_SERVICE] }).await?;
+    let end = Instant::now() + wait;
+    let mut found = None;
+    while found.is_none() && Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        found = adapter.peripherals().await?.into_iter().next();
+    }
+    adapter.stop_scan().await?;
+    Ok(found)
+}
+
+/// BLE の各手順に時間の上限を付ける。止まったまま待ち続けると、ESP32 側は接続中のまま広告をやめてしまうため
+async fn step<T>(what: &str, fut: impl Future<Output = btleplug::Result<T>>) -> Result<T, Box<dyn Error>> {
+    match tokio::time::timeout(Duration::from_secs(10), fut).await {
+        Ok(r) => Ok(r?),
+        Err(_) => Err(format!("{what}が時間切れになりました").into()),
+    }
+}
+
+async fn run_ble(app: &App, adapter: &Adapter, p: &Peripheral) -> Result<(), Box<dyn Error>> {
+    log("BLE で見つけました。接続します…");
+    step("接続", p.connect()).await?;
+    step("サービスの取得", p.discover_services()).await?;
+    let chars = p.characteristics();
+    let find = |uuid| chars.iter().find(|c| c.uuid == uuid).cloned().ok_or("GripApprover のサービスが見つかりません");
+    let (count, cmd) = (find(BLE_COUNT)?, find(BLE_CMD)?);
+
+    let mut events = adapter.events().await?;
+    step("通知の登録", p.subscribe(&count)).await?;
+    let mut notes = p.notifications().await?;
+    let mut last = le_u32(&step("回数の読み取り", p.read(&count)).await?).ok_or("回数を読めませんでした")?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    *app.writer.lock().unwrap() = Some(Link::Ble(tx));
+    set_connected(app, true, "BLE");
+    log("接続しました（BLE）");
+
+    // macOS では切断しても通知の流れが終わらないことがあるので、切断のイベントと定期的な確認の両方で見る
+    let mut check = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            Some(n) = notes.next() => {
+                if let (true, Some(value)) = (n.uuid == BLE_COUNT, le_u32(&n.value)) {
+                    app.add_count(&mut last, value);
+                }
+            }
+            Some(c) = rx.recv() => step("コマンドの送信", p.write(&cmd, &[c], WriteType::WithoutResponse)).await?,
+            Some(ev) = events.next() => {
+                if matches!(ev, CentralEvent::DeviceDisconnected(id) if id == p.id()) {
+                    return Err("切断されました".into());
+                }
+            }
+            _ = check.tick() => {
+                if !p.is_connected().await.unwrap_or(false) {
+                    return Err("切断されました".into());
+                }
+            }
         }
     }
 }
 
-fn serial_loop(app: Arc<App>) {
+// ---- 接続の管理 ----
+
+/// USB のポートがあればシリアルで、なければ BLE でつなぐ。切れたら探し直す
+fn device_loop(app: Arc<App>) {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("非同期の実行環境を作れませんでした");
+    let adapter = rt.block_on(async { Manager::new().await.ok()?.adapters().await.ok()?.into_iter().next() });
+    if adapter.is_none() {
+        log("Bluetooth が使えないため、USB だけで探します");
+    }
+    let disconnected = || {
+        *app.writer.lock().unwrap() = None;
+        set_connected(&app, false, "");
+    };
+
     let mut searching_logged = false;
     loop {
-        let Some(port) = find_port() else {
-            if !searching_logged {
-                log("ESP32 を探しています…（USB でつないでください）");
-                searching_logged = true;
+        if let Some(port) = find_port() {
+            searching_logged = false;
+            if let Err(e) = run_serial(&app, &port) {
+                log(&format!("シリアルの接続が切れました: {e}"));
             }
+            disconnected();
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        if !searching_logged {
+            log("ESP32 を探しています…（電池のスイッチを入れるか、USB でつないでください）");
+            searching_logged = true;
+        }
+        let Some(adapter) = &adapter else {
             thread::sleep(Duration::from_secs(1));
             continue;
         };
-        searching_logged = false;
-        if let Err(e) = run_connection(&app, &port) {
-            log(&format!("シリアルの接続が切れました: {e}"));
+        match rt.block_on(find_ble(adapter, Duration::from_secs(3))) {
+            Ok(Some(p)) => {
+                searching_logged = false;
+                if let Err(e) = rt.block_on(run_ble(&app, adapter, &p)) {
+                    log(&format!("BLE の接続が切れました: {e}"));
+                }
+                disconnected();
+                let _ = rt.block_on(p.disconnect());
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log(&format!("BLE で探せませんでした: {e}"));
+                thread::sleep(Duration::from_secs(3));
+            }
         }
-        *app.writer.lock().unwrap() = None;
-        set_connected(&app, false, "");
-        thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -372,7 +498,7 @@ fn main() {
     }
     {
         let app = app.clone();
-        thread::spawn(move || serial_loop(app));
+        thread::spawn(move || device_loop(app));
     }
 
     event_loop.run(move |event, _, control_flow| {
